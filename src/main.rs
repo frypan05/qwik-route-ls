@@ -34,17 +34,13 @@ fn main() -> anyhow::Result<()> {
     let initialize_value = connection.initialize(server_capabilities)?;
     let initialize_params: InitializeParams = serde_json::from_value(initialize_value)?;
 
+    #[allow(deprecated)]
     let root: PathBuf = initialize_params
-        .root_uri
+        .workspace_folders
         .as_ref()
-        .and_then(|u| u.to_file_path().ok())
-        .or_else(|| {
-            initialize_params
-                .workspace_folders
-                .as_ref()
-                .and_then(|folders| folders.first())
-                .and_then(|f| f.uri.to_file_path().ok())
-        })
+        .and_then(|folders| folders.first())
+        .and_then(|f| f.uri.to_file_path().ok())
+        .or_else(|| initialize_params.root_uri.as_ref().and_then(|u| u.to_file_path().ok()))
         .unwrap_or_else(|| PathBuf::from("."));
 
     let routes_dir = root.join("src").join("routes");
@@ -52,8 +48,17 @@ fn main() -> anyhow::Result<()> {
     let routes: RouteIndex = Arc::new(Mutex::new(scan_routes(&routes_dir)));
     let docs: Docs = Arc::new(Mutex::new(HashMap::new()));
 
-    // Watch src/routes and rebuild the route index whenever it changes,
-    // so newly added/renamed pages show up without restarting the server.
+    eprintln!(
+        "[qwik-route-ls] starting. root={:?} routes_dir={:?} exists={}",
+        root,
+        routes_dir,
+        routes_dir.is_dir()
+    );
+    eprintln!(
+        "[qwik-route-ls] initial scan found {} route(s): {:?}",
+        routes.lock().unwrap().len(),
+        routes.lock().unwrap()
+    );
     let watch_routes = routes.clone();
     let watch_dir = routes_dir.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -76,7 +81,18 @@ fn main() -> anyhow::Result<()> {
                 if req.method == Completion::METHOD {
                     let id = req.id.clone();
                     let params: CompletionParams = serde_json::from_value(req.params)?;
+                    eprintln!(
+                        "[qwik-route-ls] completion request: uri={} pos={:?}",
+                        params.text_document_position.text_document.uri,
+                        params.text_document_position.position
+                    );
                     let response = handle_completion(params, &docs, &routes);
+                    let item_count = match &response {
+                        Some(CompletionResponse::Array(items)) => items.len(),
+                        Some(CompletionResponse::List(list)) => list.items.len(),
+                        None => 0,
+                    };
+                    eprintln!("[qwik-route-ls] responding with {item_count} item(s)");
                     connection.sender.send(Message::Response(Response {
                         id,
                         result: Some(serde_json::to_value(response)?),
@@ -88,6 +104,10 @@ fn main() -> anyhow::Result<()> {
                 m if m == DidOpenTextDocument::METHOD => {
                     let p: lsp_types::DidOpenTextDocumentParams =
                         serde_json::from_value(not.params)?;
+                    eprintln!(
+                        "[qwik-route-ls] didOpen: uri={} language_id={}",
+                        p.text_document.uri, p.text_document.language_id
+                    );
                     docs.lock()
                         .unwrap()
                         .insert(p.text_document.uri, p.text_document.text);
@@ -95,8 +115,11 @@ fn main() -> anyhow::Result<()> {
                 m if m == DidChangeTextDocument::METHOD => {
                     let p: lsp_types::DidChangeTextDocumentParams =
                         serde_json::from_value(not.params)?;
-                    // We declared full-document sync, so the last change
-                    // event contains the complete new text.
+                    eprintln!(
+                        "[qwik-route-ls] didChange: uri={} changes={}",
+                        p.text_document.uri,
+                        p.content_changes.len()
+                    );
                     if let Some(change) = p.content_changes.into_iter().last() {
                         docs.lock().unwrap().insert(p.text_document.uri, change.text);
                     }
@@ -146,7 +169,7 @@ fn scan_routes(routes_dir: &Path) -> Vec<String> {
         for part in rel.components() {
             let part = part.as_os_str().to_string_lossy();
             if part.starts_with('(') && part.ends_with(')') {
-                continue; // route group: layout-only, not part of the URL
+                continue;
             }
             segments.push(part.to_string());
         }
@@ -172,14 +195,46 @@ fn handle_completion(
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
-    let docs_guard = docs.lock().ok()?;
-    let text = docs_guard.get(&uri)?;
-    let offset = position_to_offset(text, position)?;
+    let owned_text;
+    {
+        let docs_guard = docs.lock().ok()?;
+        if let Some(text) = docs_guard.get(&uri) {
+            owned_text = text.clone();
+        } else {
+            drop(docs_guard);
+            eprintln!("[qwik-route-ls] {uri} not in doc cache, falling back to disk read");
+            owned_text = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok())?;
+        }
+    }
+    let text = &owned_text;
 
-    let (value_start, value_end) = find_link_href_value_range(text, offset)?;
+    let offset = match position_to_offset(text, position) {
+        Some(o) => o,
+        None => {
+            eprintln!("[qwik-route-ls] could not map position {position:?} to an offset");
+            return None;
+        }
+    };
+
+    let (value_start, value_end) = match find_link_href_value_range(text, offset) {
+        Some(range) => range,
+        None => {
+            eprintln!(
+                "[qwik-route-ls] cursor not inside a <Link href=\"...\"> value (offset={offset})"
+            );
+            return None;
+        }
+    };
     let typed = &text[value_start..offset.min(value_end)];
 
     let routes_guard = routes.lock().ok()?;
+    eprintln!(
+        "[qwik-route-ls] matching {} route(s) against typed prefix {typed:?}",
+        routes_guard.len()
+    );
     let items: Vec<CompletionItem> = routes_guard
         .iter()
         .filter(|route| route.starts_with(typed))
@@ -247,7 +302,7 @@ fn find_link_href_value_range(text: &str, offset: usize) -> Option<(usize, usize
     let last_open = head.rfind('<')?;
     if let Some(last_close) = head.rfind('>') {
         if last_close > last_open {
-            return None; // the nearest tag was already closed
+            return None;
         }
     }
     let tag_name: String = head[last_open + 1..]
